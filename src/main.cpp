@@ -1,5 +1,13 @@
 #include "w5500.h"
 
+const byte mac_address[] = {
+    0x52, 0xff, 0xee, 0x1b, 0x44, 0x55};
+
+Wiznet5500 w5500;
+uint8_t readBuffer[1518];
+uint8_t writeBuffer[1518];
+uint8_t send_count = 0;
+
 void printPaddedHex(uint8_t byte)
 {
     char str[2];
@@ -28,6 +36,30 @@ void printMACAddress(const uint8_t address[6])
     Serial.println();
 }
 
+void resPADO(byte *payload, uint16_t length)
+{
+    memcpy(&writeBuffer[0], &readBuffer[6], 6); // Set Destination to Source
+    memcpy(&writeBuffer[6], mac_address, 6);    // Set Source to our MAC address
+    writeBuffer[12] = 0x88;
+    writeBuffer[13] = 0x63;
+    writeBuffer[14] = 0x11;
+    writeBuffer[15] = 0x07;
+    writeBuffer[16] = 0x00;
+    writeBuffer[17] = 0x00;
+    writeBuffer[18] = 0x01;
+    writeBuffer[19] = 0x20;
+    byte resPayload[] = {0x01,0x01,0x00,0x00,0x01, 0x02, 0x00, 0x04, 0x5a, 0x48, 0x4c, 0x48, 0x01, 0x03, 0x00, 0x0c, 0x2F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2F, 0x00, 0x00, 0x00};
+    
+    memcpy(&writeBuffer[20], resPayload, sizeof(resPayload));
+
+    uint16_t payload_len = sizeof(resPayload);
+    writeBuffer[18] = payload_len >> 8 & 0xFF;
+    writeBuffer[19] = payload_len & 0xFF;
+    printMACAddress(writeBuffer);
+    printMACAddress(writeBuffer + 6);
+    w5500.sendFrame(writeBuffer, 18+payload_len);
+}
+
 void parsePPPoEHeader(void *payload, uint16_t len)
 {
     uint8_t version = ((uint8_t *)payload)[0] & 0x0F;
@@ -36,21 +68,15 @@ void parsePPPoEHeader(void *payload, uint16_t len)
     Serial.printf("PPPoE Type=%d\n", type);
 
     uint8_t code = ((uint8_t *)payload)[1];
-    Serial.printf("PPPoE Code=%d\n", code);
+    Serial.printf("PPPoE Code=0x%02x\n", code);
 
-    uint16_t sessionId = ((uint8_t *)payload)[2] << 8 | ((uint8_t *)payload)[3];\
+    uint16_t sessionId = ((uint8_t *)payload)[2] << 8 | ((uint8_t *)payload)[3];
     uint16_t length = ((uint8_t *)payload)[4] << 8 | ((uint8_t *)payload)[5];
     Serial.printf("PPPoE SessionId=%d\n", sessionId);
     Serial.printf("PPPoE Length=%d\n", length);
 
     void *payloadPtr = (uint8_t *)payload + 6;
-
 }
-
-const byte mac_address[] = {
-    0x52, 0xff, 0xee, 0x1b, 0x44, 0x55};
-
-Wiznet5500 w5500;
 
 void setup()
 {
@@ -62,13 +88,10 @@ void setup()
     w5500.begin(mac_address);
 }
 
-uint8_t buffer[1518];
-uint8_t send_count = 0;
-
 void loop()
 {
 
-    uint16_t len = w5500.readFrame(buffer, sizeof(buffer));
+    uint16_t len = w5500.readFrame(readBuffer, sizeof(readBuffer));
     if (len > 0)
     {
         // Serial.print("Len=");
@@ -97,13 +120,15 @@ void loop()
         //     buffer[14] = send_count++;
         //     w5500.sendFrame(buffer, len);
         // }
-        uint16_t *ethTypeLittle = (uint16_t *)&buffer[12];
+        uint16_t *ethTypeLittle = (uint16_t *)&readBuffer[12];
         uint16_t ethType = *ethTypeLittle >> 8 | *ethTypeLittle << 8;
         if (ethType == 0x8863)
         {
+            Serial.println(len);
             Serial.println("PPPoE Discovery stage");
-            parsePPPoEHeader(buffer + 14, len - 14);
+            parsePPPoEHeader(readBuffer + 14, len - 14);
             Serial.println();
+            resPADO(readBuffer, len);
         }
         if (ethType == 0x8864)
         {
