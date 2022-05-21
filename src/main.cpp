@@ -1,91 +1,449 @@
 #include "w5500.h"
+#include "pppoe.h"
+#include "utils.h"
 
-const byte mac_address[] = {
-    0x52, 0xff, 0xee, 0x1b, 0x44, 0x55};
+using namespace std;
 
 Wiznet5500 w5500;
 uint8_t readBuffer[1518];
 uint8_t writeBuffer[1518];
-uint8_t send_count = 0;
+uint16_t sessionId = 0x0000;
+bool flag = false;
 
-void printPaddedHex(uint8_t byte)
+class PPPoETag
 {
-    char str[2];
-    str[0] = (byte >> 4) & 0x0f;
-    str[1] = byte & 0x0f;
+public:
+    PPPoETag() {}
 
-    for (int i = 0; i < 2; i++)
+    PPPoETag(uint8_t const *buf, uint16_t len)
     {
-        // base for converting single digit numbers to ASCII is 48
-        // base for 10-16 to become lower-case characters a-f is 87
-        if (str[i] > 9)
-            str[i] += 39;
-        str[i] += 48;
-        Serial.print(str[i]);
+        tagType = buf[0] << 8 | buf[1];
+        for (uint16_t i = 4; i < len; i++)
+        {
+            tagData.push_back(buf[i]);
+        }
     }
-}
 
-void printMACAddress(const uint8_t address[6])
-{
-    for (uint8_t i = 0; i < 6; ++i)
+    uint16_t tagType;
+    vector<uint8_t> tagData;
+    uint16_t size()
     {
-        printPaddedHex(address[i]);
-        if (i < 5)
-            Serial.print(':');
+        return 4 + tagData.size();
     }
-    Serial.println();
+};
+
+class PPPOption
+{
+public:
+    uint8_t type;
+    vector<uint8_t> data;
+
+    PPPOption() {}
+
+    uint16_t size()
+    {
+        return 2 + data.size();
+    }
+};
+
+class Ethernet
+{
+public:
+    array<uint8_t, 6> srcMac;
+    array<uint8_t, 6> dstMac;
+    uint16_t ethType;
+};
+
+class PPPoE : public Ethernet
+{
+public:
+    uint8_t ver;
+    uint8_t type;
+    uint8_t code;
+    uint16_t sessionId;
+    uint16_t payloadLen;
+};
+
+class PPPoEDiscovery : public PPPoE
+{
+public:
+    vector<PPPoETag> tags;
+
+    PPPoEDiscovery() {}
+    PPPoEDiscovery(uint8_t *buf, uint16_t ethFrameLen)
+    {
+        dstMac = {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]};
+        srcMac = {buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]};
+        ethType = (buf[12] << 8) + buf[13];
+        ver = buf[14] >> 4 && 0x0F;
+        type = buf[14] & 0x0F;
+        code = buf[15];
+        sessionId = (buf[16] << 8) + buf[17];
+        payloadLen = (buf[18] << 8) + buf[19];
+        for (int i = 20; i < 20 + payloadLen;)
+        {
+            PPPoETag tag;
+            tag.tagType = (buf[i] << 8) + buf[i + 1];
+            uint16_t tagLen = (buf[i + 2] << 8) + buf[i + 3];
+            for (int j = 0; j < tagLen; j++)
+            {
+                tag.tagData.push_back(buf[i + 4 + j]);
+            }
+            tags.push_back(tag);
+            i += 4 + tagLen;
+        }
+    }
+
+    PPPoETag getHostUniqTag()
+    {
+        for (auto tag : tags)
+        {
+            if (tag.tagType == 0x0103)
+            {
+                return tag;
+            }
+        }
+        return PPPoETag();
+    }
+
+    uint16_t size()
+    {
+        uint16_t res = 20;
+        for (auto &tag : tags)
+        {
+            res += tag.size();
+        }
+        return res;
+    }
+
+    PPPoEDiscovery clone()
+    {
+        PPPoEDiscovery req;
+        req.srcMac = srcMac;
+        req.dstMac = dstMac;
+        req.ethType = ethType;
+        req.ver = ver;
+        req.type = type;
+        req.code = code;
+        req.sessionId = sessionId;
+        req.payloadLen = payloadLen;
+        for (auto tag : tags)
+        {
+            PPPoETag newTag;
+            newTag.tagType = tag.tagType;
+            for (auto data : tag.tagData)
+            {
+                newTag.tagData.push_back(data);
+            }
+            req.tags.push_back(newTag);
+        }
+        return req;
+    }
+
+    vector<uint8_t> toBytes()
+    {
+        vector<uint8_t> buf;
+        buf.insert(buf.end(), dstMac.begin(), dstMac.end());
+        buf.insert(buf.end(), srcMac.begin(), srcMac.end());
+        buf.push_back(ethType >> 8);
+        buf.push_back(ethType & 0xFF);
+        buf.push_back(ver << 4 | type);
+        buf.push_back(code);
+        buf.push_back(sessionId >> 8);
+        buf.push_back(sessionId & 0xFF);
+
+        uint16_t tagsSize = 0;
+        for (auto tag : tags)
+        {
+            tagsSize += tag.size();
+        }
+
+        buf.push_back(tagsSize >> 8);
+        buf.push_back(tagsSize & 0xFF);
+        for (auto tag : tags)
+        {
+            buf.push_back(tag.tagType >> 8);
+            buf.push_back(tag.tagType & 0xFF);
+            buf.push_back(tag.tagData.size() >> 8);
+            buf.push_back(tag.tagData.size() & 0xFF);
+            for (auto data : tag.tagData)
+            {
+                buf.push_back(data);
+            }
+        }
+        return buf;
+    }
+
+    String toString()
+    {
+        String str;
+        str += "ver: " + String(ver) + "\n";
+        str += "type: " + String(type) + "\n";
+        str += "code: " + String(code) + "\n";
+        str += "sessionId: " + String(sessionId, HEX) + "\n";
+        str += "payloadLen: " + String(payloadLen) + "\n";
+        for (auto tag : tags)
+        {
+            str += "tagType: " + String(tag.tagType, HEX) + "\n";
+            str += "tagData: ";
+            for (auto data : tag.tagData)
+            {
+                str += String(data, HEX) + " ";
+            }
+            str += "\n";
+        }
+        return str;
+    }
+};
+
+class PPPoESession : public PPPoE
+{
+public:
+    uint16_t protocol;
+    uint8_t pppCode;
+    uint8_t pppIdentifier;
+    // ppp length indicate the length of ppp link control protocol
+    uint16_t pppLength;
+
+    vector<PPPOption> options;
+
+    PPPoESession() {}
+    PPPoESession(uint8_t *buf, uint16_t ethFrameLen)
+    {
+        dstMac = {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]};
+        srcMac = {buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]};
+        ethType = (buf[12] << 8) + buf[13];
+        ver = buf[14] >> 4 && 0x0F;
+        type = buf[14] & 0x0F;
+        code = buf[15];
+        sessionId = (buf[16] << 8) + buf[17];
+        payloadLen = (buf[18] << 8) + buf[19];
+        protocol = (buf[20] << 8) + buf[21];
+        pppCode = buf[22];
+        pppIdentifier = buf[23];
+        pppLength = (buf[24] << 8) + buf[25];
+        for (int i = 26; i < 26 + pppLength - 4;)
+        {
+            PPPOption option;
+            option.type = buf[i];
+            uint8_t optionLen = buf[i + 1];
+            for (int j = 2; j < optionLen; j++)
+            {
+                option.data.push_back(buf[i + j]);
+            }
+            options.push_back(option);
+            i += optionLen;
+        }
+    }
+
+    PPPoESession clone()
+    {
+        PPPoESession req;
+        req.srcMac = srcMac;
+        req.dstMac = dstMac;
+        req.ethType = ethType;
+        req.ver = ver;
+        req.type = type;
+        req.code = code;
+        req.sessionId = sessionId;
+        req.payloadLen = payloadLen;
+        req.protocol = protocol;
+        req.pppCode = pppCode;
+        req.pppIdentifier = pppIdentifier;
+        req.pppLength = pppLength;
+        for (auto option : options)
+        {
+            PPPOption newOption;
+            newOption.type = option.type;
+            for (auto data : option.data)
+            {
+                newOption.data.push_back(data);
+            }
+            req.options.push_back(newOption);
+        }
+        return req;
+    }
+
+    vector<uint8_t> toBytes()
+    {
+        vector<uint8_t> buf;
+        buf.insert(buf.end(), dstMac.begin(), dstMac.end());
+        buf.insert(buf.end(), srcMac.begin(), srcMac.end());
+        buf.push_back(ethType >> 8);
+        buf.push_back(ethType & 0xFF);
+        buf.push_back(ver << 4 | type);
+        buf.push_back(code);
+        buf.push_back(sessionId >> 8);
+        buf.push_back(sessionId & 0xFF);
+
+        uint16_t payloadSize = 6;
+        for (auto opt : options)
+        {
+            payloadSize += opt.size();
+        }
+        buf.push_back(payloadSize >> 8);
+        buf.push_back(payloadSize & 0xFF);
+        buf.push_back(protocol >> 8);
+        buf.push_back(protocol & 0xFF);
+        buf.push_back(pppCode);
+        buf.push_back(pppIdentifier);
+        uint16_t optSize = 4;
+        for (auto opt : options)
+        {
+            optSize += opt.size();
+        }
+        buf.push_back(optSize >> 8);
+        buf.push_back(optSize & 0xFF);
+        for (auto opt : options)
+        {
+            buf.push_back(opt.type);
+            buf.push_back(opt.data.size() + 2);
+            for (auto data : opt.data)
+            {
+                buf.push_back(data);
+            }
+        }
+
+        return buf;
+    }
+
+    uint16_t size()
+    {
+        uint16_t res = 26;
+        for (auto &option : options)
+        {
+            res += option.size();
+        }
+        return res;
+    }
+
+    String toString()
+    {
+        String str;
+        str += "ver: " + String(ver) + "\n";
+        str += "type: " + String(type) + "\n";
+        str += "code: " + String(code) + "\n";
+        str += "sessionId: " + String(sessionId, HEX) + "\n";
+        str += "payloadLen: " + String(payloadLen) + "\n";
+        str += "protocol: " + String(protocol, HEX) + "\n";
+        str += "pppCode: " + String(pppCode, HEX) + "\n";
+        str += "pppIdentifier: " + String(pppIdentifier, HEX) + "\n";
+        str += "pppLength: " + String(pppLength, HEX) + "\n";
+        for (auto option : options)
+        {
+            str += "optionType: " + String(option.type, HEX) + "\n";
+            str += "optionData: ";
+            for (auto data : option.data)
+            {
+                str += String(data, HEX) + " ";
+            }
+            str += "\n";
+        }
+        return str;
+    }
+};
+
+void sendCfgReject(PPPoESession req)
+{
+    auto res = req.clone();
+    res.dstMac = req.srcMac;
+    fillDeviceMAC(res.srcMac);
+    res.pppCode = 0x04;
+    w5500.sendFrame(&res.toBytes()[0], res.size());
 }
 
-void resPADO(byte *payload, uint16_t length)
+void sendDeviceOpt(PPPoESession req)
 {
-    memcpy(&writeBuffer[0], &readBuffer[6], 6); // Set Destination to Source
-    memcpy(&writeBuffer[6], mac_address, 6);    // Set Source to our MAC address
-    writeBuffer[12] = 0x88;
-    writeBuffer[13] = 0x63;
-    writeBuffer[14] = 0x11;
-    writeBuffer[15] = 0x07;
-    writeBuffer[16] = 0x00;
-    writeBuffer[17] = 0x00;
-    writeBuffer[18] = 0x01;
-    writeBuffer[19] = 0x20;
-    byte resPayload[] = {0x01,0x01,0x00,0x00,0x01, 0x02, 0x00, 0x04, 0x5a, 0x48, 0x4c, 0x48, 0x01, 0x03, 0x00, 0x0c, 0x2F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2F, 0x00, 0x00, 0x00};
-    
-    memcpy(&writeBuffer[20], resPayload, sizeof(resPayload));
+    auto res = req.clone();
+    res.dstMac = req.srcMac;
+    fillDeviceMAC(res.srcMac);
+    res.options.clear();
+    PPPOption maxRecUnit;
+    maxRecUnit.type = 0x01;
+    maxRecUnit.data.push_back(0x05);
+    maxRecUnit.data.push_back(0xc8);
 
-    uint16_t payload_len = sizeof(resPayload);
-    writeBuffer[18] = payload_len >> 8 & 0xFF;
-    writeBuffer[19] = payload_len & 0xFF;
-    printMACAddress(writeBuffer);
-    printMACAddress(writeBuffer + 6);
-    w5500.sendFrame(writeBuffer, 18+payload_len);
+    PPPOption magicNum;
+    magicNum.type = 0x05;
+    magicNum.data.push_back(0x10);
+    magicNum.data.push_back(0x25);
+    magicNum.data.push_back(0x16);
+    magicNum.data.push_back(0x52);
+    res.options.push_back(maxRecUnit);
+    res.options.push_back(magicNum);
+    w5500.sendFrame(&res.toBytes()[0], res.size());
 }
 
-void parsePPPoEHeader(void *payload, uint16_t len)
+void handlePADI(PPPoEDiscovery req)
 {
-    uint8_t version = ((uint8_t *)payload)[0] & 0x0F;
-    uint8_t type = ((uint8_t *)payload)[0] >> 4;
-    Serial.printf("PPPoE Version=%d\n", version);
-    Serial.printf("PPPoE Type=%d\n", type);
+    // response PADO
+    auto res = req.clone();
+    res.dstMac = req.srcMac;
+    fillDeviceMAC(res.srcMac);
+    res.code = 0x07;
+    PPPoETag anyService(ANY_SERVICE_TAG, sizeof(ANY_SERVICE_TAG));
+    PPPoETag acName(AC_NAME, sizeof(AC_NAME));
+    PPPoETag hostuniq = req.getHostUniqTag();
+    res.tags.clear();
+    res.tags.push_back(anyService);
+    res.tags.push_back(acName);
+    if (hostuniq.tagType != 0x00)
+    {
+        res.tags.push_back(hostuniq);
+    }
+    w5500.sendFrame(&res.toBytes()[0], res.size());
+}
 
-    uint8_t code = ((uint8_t *)payload)[1];
-    Serial.printf("PPPoE Code=0x%02x\n", code);
+void handlePADR(PPPoEDiscovery req)
+{
+    // response PADS
+    auto res = req.clone();
+    res.dstMac = req.srcMac;
+    fillDeviceMAC(res.srcMac);
+    res.code = 0x65;
+    res.sessionId = random(1025);
+    PPPoETag anyService(ANY_SERVICE_TAG, sizeof(ANY_SERVICE_TAG));
+    PPPoETag acName(AC_NAME, sizeof(AC_NAME));
+    PPPoETag hostuniq = req.getHostUniqTag();
+    res.tags.clear();
+    res.tags.push_back(anyService);
+    res.tags.push_back(acName);
+    if (hostuniq.tagType != 0x00)
+    {
+        res.tags.push_back(hostuniq);
+    }
+    w5500.sendFrame(&res.toBytes()[0], res.size());
+}
 
-    uint16_t sessionId = ((uint8_t *)payload)[2] << 8 | ((uint8_t *)payload)[3];
-    uint16_t length = ((uint8_t *)payload)[4] << 8 | ((uint8_t *)payload)[5];
-    Serial.printf("PPPoE SessionId=%d\n", sessionId);
-    Serial.printf("PPPoE Length=%d\n", length);
-
-    void *payloadPtr = (uint8_t *)payload + 6;
+void handleCfgReq(PPPoESession req)
+{
+    // 直接拒绝
+    if (!flag)
+    {
+        sendCfgReject(req);
+        flag = true;
+        sendDeviceOpt(req);
+        return;
+    }
+    auto res = req.clone();
+    res.dstMac = req.srcMac;
+    fillDeviceMAC(res.srcMac);
+    res.pppCode = 0x02;
+    Serial.println("res:");
+    Serial.println(res.toString());
+    w5500.sendFrame(&res.toBytes()[0], res.size());
 }
 
 void setup()
 {
     // Setup serial port for debugging
     Serial.begin(115200);
-    Serial.println("[W5500MacRaw]");
-    printMACAddress(mac_address);
+    randomSeed(analogRead(0));
 
-    w5500.begin(mac_address);
+    Serial.println("Starting...,MAC Address:");
+    printMACAddress(MAC_ADDRESS);
+
+    w5500.begin(MAC_ADDRESS);
 }
 
 void loop()
@@ -94,45 +452,31 @@ void loop()
     uint16_t len = w5500.readFrame(readBuffer, sizeof(readBuffer));
     if (len > 0)
     {
-        // Serial.print("Len=");
-        // Serial.println(len, DEC);
-
-        // Serial.print("Dest=");
-        // printMACAddress(&buffer[0]);
-        // Serial.print("Src=");
-        // printMACAddress(&buffer[6]);
-
-        // // 0x0800 = IPv4
-        // // 0x0806 = ARP
-        // // 0x86DD = IPv6
-        // Serial.print("Type=0x");
-        // printPaddedHex(buffer[12]);
-        // printPaddedHex(buffer[13]);
-        // Serial.println();
-
-        // Reply to the 0x88B5 Local Experimental Ethertype
-        // if (buffer[12] == 0x88 && buffer[13] == 0xB5) {
-        //     Serial.print("Byte 15=");
-        //     Serial.println(buffer[15], DEC);
-
-        //     memcpy(&buffer[0], &buffer[6], 6);   // Set Destination to Source
-        //     memcpy(&buffer[6], mac_address, 6);  // Set Source to our MAC address
-        //     buffer[14] = send_count++;
-        //     w5500.sendFrame(buffer, len);
-        // }
         uint16_t *ethTypeLittle = (uint16_t *)&readBuffer[12];
         uint16_t ethType = *ethTypeLittle >> 8 | *ethTypeLittle << 8;
         if (ethType == 0x8863)
         {
-            Serial.println(len);
-            Serial.println("PPPoE Discovery stage");
-            parsePPPoEHeader(readBuffer + 14, len - 14);
-            Serial.println();
-            resPADO(readBuffer, len);
+            // Serial.println("PPPoE Discovery stage");
+            PPPoEDiscovery req(readBuffer, len);
+            if (req.code == 0x09)
+            {
+                handlePADI(req);
+            }
+            if (req.code == 0x19)
+            {
+                handlePADR(req);
+            }
         }
         if (ethType == 0x8864)
         {
-            Serial.print("PPPoE Session stage");
+            // Serial.println("PPPoE Session stage");
+            // parsePPPoEHeader(readBuffer + 14, len - 14);
+            PPPoESession req(readBuffer, len);
+            if (req.protocol == 0xc021 && req.pppCode == 0x01)
+            {
+                // Serial.println("PPP Configure Request");
+                handleCfgReq(req);
+            }
         }
     }
 }
