@@ -13,7 +13,7 @@ bool flag = false;
 class PPPoETag
 {
 public:
-    PPPoETag() {}
+    PPPoETag() = default;
 
     PPPoETag(uint8_t const *buf, uint16_t len)
     {
@@ -24,9 +24,9 @@ public:
         }
     }
 
-    uint16_t tagType;
+    uint16_t tagType{};
     vector<uint8_t> tagData;
-    uint16_t size()
+    uint16_t size() const
     {
         return 4 + tagData.size();
     }
@@ -35,12 +35,12 @@ public:
 class PPPOption
 {
 public:
-    uint8_t type;
+    uint8_t type{};
     vector<uint8_t> data;
 
-    PPPOption() {}
+    PPPOption() = default;
 
-    uint16_t size()
+    uint16_t size() const
     {
         return 2 + data.size();
     }
@@ -69,13 +69,13 @@ class PPPoEDiscovery : public PPPoE
 public:
     vector<PPPoETag> tags;
 
-    PPPoEDiscovery() {}
-    PPPoEDiscovery(uint8_t *buf, uint16_t ethFrameLen)
+    PPPoEDiscovery() : PPPoE() {}
+    PPPoEDiscovery(uint8_t *buf, uint16_t ethFrameLen) : PPPoE()
     {
         dstMac = {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]};
         srcMac = {buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]};
         ethType = (buf[12] << 8) + buf[13];
-        ver = buf[14] >> 4 && 0x0F;
+        ver = buf[14] >> 4 != 0;
         type = buf[14] & 0x0F;
         code = buf[15];
         sessionId = (buf[16] << 8) + buf[17];
@@ -103,7 +103,7 @@ public:
                 return tag;
             }
         }
-        return PPPoETag();
+        return {};
     }
 
     uint16_t size()
@@ -127,7 +127,7 @@ public:
         req.code = code;
         req.sessionId = sessionId;
         req.payloadLen = payloadLen;
-        for (auto tag : tags)
+        for (const auto& tag : tags)
         {
             PPPoETag newTag;
             newTag.tagType = tag.tagType;
@@ -160,7 +160,7 @@ public:
 
         buf.push_back(tagsSize >> 8);
         buf.push_back(tagsSize & 0xFF);
-        for (auto tag : tags)
+        for (const auto& tag : tags)
         {
             buf.push_back(tag.tagType >> 8);
             buf.push_back(tag.tagType & 0xFF);
@@ -182,7 +182,7 @@ public:
         str += "code: " + String(code) + "\n";
         str += "sessionId: " + String(sessionId, HEX) + "\n";
         str += "payloadLen: " + String(payloadLen) + "\n";
-        for (auto tag : tags)
+        for (const auto& tag : tags)
         {
             str += "tagType: " + String(tag.tagType, HEX) + "\n";
             str += "tagData: ";
@@ -199,21 +199,21 @@ public:
 class PPPoESession : public PPPoE
 {
 public:
-    uint16_t protocol;
-    uint8_t pppCode;
-    uint8_t pppIdentifier;
+    uint16_t protocol{};
+    uint8_t pppCode{};
+    uint8_t pppIdentifier{};
     // ppp length indicate the length of ppp link control protocol
-    uint16_t pppLength;
+    uint16_t pppLength{};
 
     vector<PPPOption> options;
 
-    PPPoESession() {}
-    PPPoESession(uint8_t *buf, uint16_t ethFrameLen)
+    PPPoESession() : PPPoE() {}
+    PPPoESession(uint8_t *buf, uint16_t ethFrameLen) : PPPoE()
     {
         dstMac = {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]};
         srcMac = {buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]};
         ethType = (buf[12] << 8) + buf[13];
-        ver = buf[14] >> 4 && 0x0F;
+        ver = buf[14] >> 4 != 0;
         type = buf[14] & 0x0F;
         code = buf[15];
         sessionId = (buf[16] << 8) + buf[17];
@@ -251,7 +251,7 @@ public:
         req.pppCode = pppCode;
         req.pppIdentifier = pppIdentifier;
         req.pppLength = pppLength;
-        for (auto option : options)
+        for (const auto& option : options)
         {
             PPPOption newOption;
             newOption.type = option.type;
@@ -294,7 +294,7 @@ public:
         }
         buf.push_back(optSize >> 8);
         buf.push_back(optSize & 0xFF);
-        for (auto opt : options)
+        for (const auto& opt : options)
         {
             buf.push_back(opt.type);
             buf.push_back(opt.data.size() + 2);
@@ -329,7 +329,7 @@ public:
         str += "pppCode: " + String(pppCode, HEX) + "\n";
         str += "pppIdentifier: " + String(pppIdentifier, HEX) + "\n";
         str += "pppLength: " + String(pppLength, HEX) + "\n";
-        for (auto option : options)
+        for (const auto& option : options)
         {
             str += "optionType: " + String(option.type, HEX) + "\n";
             str += "optionData: ";
@@ -452,7 +452,7 @@ void loop()
     uint16_t len = w5500.readFrame(readBuffer, sizeof(readBuffer));
     if (len > 0)
     {
-        uint16_t *ethTypeLittle = (uint16_t *)&readBuffer[12];
+        auto *ethTypeLittle = (uint16_t *)&readBuffer[12];
         uint16_t ethType = *ethTypeLittle >> 8 | *ethTypeLittle << 8;
         if (ethType == 0x8863)
         {
