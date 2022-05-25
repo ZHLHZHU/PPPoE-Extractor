@@ -134,7 +134,7 @@ public:
         buf.push_back(sessionId & 0xFF);
 
         uint16_t tagsSize = 0;
-        for (const auto& tag: tags) {
+        for (const auto &tag: tags) {
             tagsSize += tag.size();
         }
 
@@ -255,7 +255,7 @@ public:
         buf.push_back(pppCode);
         buf.push_back(pppIdentifier);
         uint16_t optSize = 4;
-        for (const auto& opt: options) {
+        for (const auto &opt: options) {
             optSize += opt.size();
         }
         buf.push_back(optSize >> 8);
@@ -302,6 +302,118 @@ public:
     }
 };
 
+/**
+ * PPP Password Authentication Protocol
+ */
+class PAP : public PPPoESession {
+public:
+    vector<vector<uint8_t>> authDataList;
+
+    PAP() : PPPoESession() {}
+
+    PAP(uint8_t *buf, uint16_t ethFrameLen) {
+        dstMac = {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]};
+        srcMac = {buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]};
+        ethType = (buf[12] << 8) + buf[13];
+        ver = buf[14] >> 4 != 0;
+        type = buf[14] & 0x0F;
+        code = buf[15];
+        sessionId = (buf[16] << 8) + buf[17];
+        payloadLen = (buf[18] << 8) + buf[19];
+        protocol = (buf[20] << 8) + buf[21];
+        pppCode = buf[22];
+        pppIdentifier = buf[23];
+        pppLength = (buf[24] << 8) + buf[25];
+        for (int i = 26; i < 26 + pppLength - 4;) {
+            uint8_t authDataLen = buf[i];
+            vector<uint8_t> authData;
+            for (int j = 1; j <= authDataLen; j++) {
+                authData.push_back(buf[i + j]);
+            }
+            authDataList.push_back(authData);
+            i += authDataLen + 1;
+        }
+    }
+
+    vector<uint8_t> toBytes() {
+        vector<uint8_t> buf;
+        buf.insert(buf.end(), dstMac.begin(), dstMac.end());
+        buf.insert(buf.end(), srcMac.begin(), srcMac.end());
+        buf.push_back(ethType >> 8);
+        buf.push_back(ethType & 0xFF);
+        buf.push_back(ver << 4 | type);
+        buf.push_back(code);
+        buf.push_back(sessionId >> 8);
+        buf.push_back(sessionId & 0xFF);
+
+        uint16_t payloadSize = 6;
+        for (const auto &authData: authDataList) {
+            payloadSize += authData.size() + 1;
+        }
+        buf.push_back(payloadSize >> 8);
+        buf.push_back(payloadSize & 0xFF);
+        buf.push_back(protocol >> 8);
+        buf.push_back(protocol & 0xFF);
+        buf.push_back(pppCode);
+        buf.push_back(pppIdentifier);
+        uint16_t optSize = 4;
+        for (const auto &authData: authDataList) {
+            optSize += authData.size() + 1;
+        }
+        buf.push_back(optSize >> 8);
+        buf.push_back(optSize & 0xFF);
+        for (const auto &authData: authDataList) {
+            buf.push_back(authData.size());
+            for (auto data: authData) {
+                buf.push_back(data);
+            }
+        }
+
+        return buf;
+    }
+
+    PAP clone() {
+        vector<uint8_t> bytes = PPPoESession::toBytes();
+        PAP req(&bytes[0], bytes.size());
+        for (const auto &authData: authDataList) {
+            vector<uint8_t> newAuthData(authData.begin(), authData.end());
+            req.authDataList.push_back(newAuthData);
+        }
+        return req;
+    }
+
+    String toString() {
+        String str;
+        str += "ver: " + String(ver) + "\n";
+        str += "type: " + String(type) + "\n";
+        str += "code: " + String(code) + "\n";
+        str += "sessionId: " + String(sessionId, HEX) + "\n";
+        str += "payloadLen: " + String(payloadLen) + "\n";
+        str += "protocol: " + String(protocol, HEX) + "\n";
+        str += "pppCode: " + String(pppCode, HEX) + "\n";
+        str += "pppIdentifier: " + String(pppIdentifier, HEX) + "\n";
+        str += "pppLength: " + String(pppLength, HEX) + "\n";
+        for (const auto &authData: authDataList) {
+            str += "authData: ";
+            for (auto data: authData) {
+                str += String(data, HEX) + " ";
+            }
+            str += "\n";
+        }
+        return str;
+    }
+
+    uint16_t size() {
+        uint16_t res = 26;
+        for (const auto &authData: authDataList) {
+            res += authData.size() + 1;
+        }
+        return res;
+    }
+};
+
+void handlePAP(PPPoESession req);
+
 void sendCfgReject(PPPoESession req) {
     auto res = req.clone();
     res.dstMac = req.srcMac;
@@ -320,6 +432,11 @@ void sendDeviceOpt(PPPoESession req) {
     maxRecUnit.data.push_back(0x05);
     maxRecUnit.data.push_back(0xc8);
 
+    PPPOption authProto;
+    authProto.type = 0x03;
+    authProto.data.push_back(0xc0);
+    authProto.data.push_back(0x23);
+
     PPPOption magicNum;
     magicNum.type = 0x05;
     magicNum.data.push_back(0x10);
@@ -327,6 +444,7 @@ void sendDeviceOpt(PPPoESession req) {
     magicNum.data.push_back(0x16);
     magicNum.data.push_back(0x52);
     res.options.push_back(maxRecUnit);
+    res.options.push_back(authProto);
     res.options.push_back(magicNum);
     w5500.sendFrame(&res.toBytes()[0], res.size());
 }
@@ -380,9 +498,52 @@ void handleCfgReq(PPPoESession req) {
     res.dstMac = req.srcMac;
     fillDeviceMAC(res.srcMac);
     res.pppCode = 0x02;
-    Serial.println("res:");
-    Serial.println(res.toString());
     w5500.sendFrame(&res.toBytes()[0], res.size());
+}
+
+void handlePAP(uint16_t len) {
+    PAP pap = PAP(readBuffer, len);
+    vector<uint8_t> &user = pap.authDataList[0];
+    vector<uint8_t> &pass = pap.authDataList[1];
+    char userName[user.size() + 1];
+    char passWord[pass.size() + 1];
+    for (int i = 0; i < user.size(); i++) {
+        userName[i] = user[i];
+    }
+    userName[user.size()] = '\0';
+    for (int i = 0; i < pass.size(); i++) {
+        passWord[i] = pass[i];
+    }
+    passWord[pass.size()] = '\0';
+    Serial.println("Username:" + String(userName));
+    Serial.println("Password:" + String(passWord));
+    
+    // 发送PAP Authentication-NAK
+    auto res = pap.clone();
+    res.dstMac = pap.srcMac;
+    fillDeviceMAC(res.srcMac);
+    res.pppCode = 0x03;
+    res.authDataList.clear();
+    String resMsg = "Login incorrect";
+    vector<uint8_t> authData;
+    for (auto c: resMsg) {
+        authData.push_back(c);
+    }
+    res.authDataList.push_back(authData);
+    w5500.sendFrame(&res.toBytes()[0], res.size());
+    // LCP Terminate-Request
+    PPPoESession lcp;
+    lcp.dstMac = pap.srcMac;
+    fillDeviceMAC(lcp.srcMac);
+    lcp.ver = 0x01;
+    lcp.type = 0x01;
+    lcp.code = 0x00;
+    lcp.sessionId = pap.sessionId;
+    lcp.protocol = 0xc021;
+    lcp.pppCode = 0x05;
+    lcp.pppIdentifier = pap.pppIdentifier;
+    lcp.pppLength = 0x00;
+    w5500.sendFrame(&lcp.toBytes()[0], lcp.size());
 }
 
 void setup() {
@@ -403,7 +564,6 @@ void loop() {
         auto *ethTypeLittle = (uint16_t *) &readBuffer[12];
         uint16_t ethType = *ethTypeLittle >> 8 | *ethTypeLittle << 8;
         if (ethType == 0x8863) {
-            // Serial.println("PPPoE Discovery stage");
             PPPoEDiscovery req(readBuffer, len);
             if (req.code == 0x09) {
                 handlePADI(req);
@@ -420,6 +580,10 @@ void loop() {
                 // Serial.println("PPP Configure Request");
                 handleCfgReq(req);
             }
+            if (req.protocol == 0xc023 && req.pppCode == 0x01) {
+                handlePAP(len);
+            }
         }
     }
 }
+
